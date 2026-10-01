@@ -965,6 +965,257 @@ function SyncDB.migrateSidecar(doc_path, device_id)
     return true
 end
 
+local function copyTree(src, dst)
+    local mode = lfs.attributes(src, "mode")
+    if mode == "file" then
+        return copyFile(src, dst)
+    elseif mode ~= "directory" then
+        return false
+    end
+    ensureDir(dst)
+    for _, name in ipairs(listDir(src)) do
+        if not copyTree(pathJoin(src, name), pathJoin(dst, name)) then
+            return false
+        end
+    end
+    return true
+end
+
+local function removeTree(path)
+    local mode = lfs.attributes(path, "mode")
+    if mode == "file" then
+        os.remove(path)
+        return true
+    elseif mode ~= "directory" then
+        return true
+    end
+    for _, name in ipairs(listDir(path)) do
+        removeTree(pathJoin(path, name))
+    end
+    lfs.rmdir(path)
+    return true
+end
+
+function SyncDB.namesForBook(root, book_id)
+    root = root or SyncDB.getLocalRoot()
+    local canonical = SyncDB.resolveRedirect(root, book_id)
+    local names = {}
+    local by_name = pathJoin(root, "by-name")
+    for _, norm in ipairs(listDir(by_name)) do
+        for _, id in ipairs(listDir(pathJoin(by_name, norm))) do
+            if not isSyncConflictName(id)
+                and SyncDB.resolveRedirect(root, id) == canonical then
+                table.insert(names, norm)
+                break
+            end
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+--- List canonical books in the local store.
+function SyncDB.listBookSummaries(root)
+    root = root or SyncDB.getLocalRoot()
+    local books = {}
+    local book_root = pathJoin(root, "book")
+    for _, id in ipairs(listDir(book_root)) do
+        if SyncDB.resolveRedirect(root, id) == id then
+            local marks = SyncDB.listMarks(root, id)
+            local names = SyncDB.namesForBook(root, id)
+            table.insert(books, {
+                book_id = id,
+                names = names,
+                mark_count = #marks,
+                label = (#names > 0 and table.concat(names, " / ") or id)
+                    .. " (" .. tostring(#marks) .. ")",
+            })
+        end
+    end
+    table.sort(books, function(a, b)
+        return (a.names[1] or a.book_id) < (b.names[1] or b.book_id)
+    end)
+    return books
+end
+
+function SyncDB.backupDir(root)
+    return pathJoin(root or SyncDB.getLocalRoot(), "backup")
+end
+
+--- Snapshot books involved in a merge so it can be undone.
+function SyncDB.backupMerge(root, to_id, from_ids)
+    root = root or SyncDB.getLocalRoot()
+    local ts = os.date("%Y%m%d-%H%M%S")
+    local bak = pathJoin(SyncDB.backupDir(root), "merge-" .. ts)
+    ensureDir(pathJoin(bak, "book"))
+    local ids = { to_id }
+    for _, id in ipairs(from_ids or {}) do
+        table.insert(ids, id)
+    end
+    for _, id in ipairs(ids) do
+        local src = bookDir(root, id)
+        if lfs.attributes(src, "mode") == "directory" then
+            if not copyTree(src, pathJoin(bak, "book", id)) then
+                return nil, "copy_failed"
+            end
+        end
+    end
+    -- Keep by-name / by-fp links that point at these ids.
+    ensureDir(pathJoin(bak, "by-name"))
+    ensureDir(pathJoin(bak, "by-fp"))
+    local by_name = pathJoin(root, "by-name")
+    for _, norm in ipairs(listDir(by_name)) do
+        for _, id in ipairs(listDir(pathJoin(by_name, norm))) do
+            for _, wanted in ipairs(ids) do
+                if id == wanted then
+                    SyncDB.touchLink(pathJoin(bak, "by-name", norm, id))
+                end
+            end
+        end
+    end
+    local by_fp = pathJoin(root, "by-fp")
+    for _, fp in ipairs(listDir(by_fp)) do
+        for _, id in ipairs(listDir(pathJoin(by_fp, fp))) do
+            for _, wanted in ipairs(ids) do
+                if id == wanted then
+                    SyncDB.touchLink(pathJoin(bak, "by-fp", fp, id))
+                end
+            end
+        end
+    end
+    SyncDB.writeLua(pathJoin(bak, "manifest.lua"), {
+        type = "merge",
+        time = ts,
+        to_id = to_id,
+        from_ids = from_ids,
+    })
+    return bak
+end
+
+function SyncDB.listMergeBackups(root)
+    root = root or SyncDB.getLocalRoot()
+    local backups = {}
+    for _, name in ipairs(listDir(SyncDB.backupDir(root))) do
+        if name:sub(1, 6) == "merge-" then
+            local path = pathJoin(SyncDB.backupDir(root), name)
+            local manifest = SyncDB.readLua(pathJoin(path, "manifest.lua"))
+            if manifest and manifest.type == "merge" then
+                table.insert(backups, {
+                    path = path,
+                    name = name,
+                    time = manifest.time or name:sub(7),
+                    to_id = manifest.to_id,
+                    from_ids = manifest.from_ids or {},
+                })
+            end
+        end
+    end
+    table.sort(backups, function(a, b) return a.name > b.name end)
+    return backups
+end
+
+--- Restore a merge backup (book trees and index links).
+function SyncDB.restoreMergeBackup(root, bak_path)
+    root = root or SyncDB.getLocalRoot()
+    local manifest = SyncDB.readLua(pathJoin(bak_path, "manifest.lua"))
+    if not manifest or manifest.type ~= "merge" then
+        return false, "bad_manifest"
+    end
+    local bak_books = pathJoin(bak_path, "book")
+    for _, id in ipairs(listDir(bak_books)) do
+        local dst = bookDir(root, id)
+        removeTree(dst)
+        if not copyTree(pathJoin(bak_books, id), dst) then
+            return false, "restore_book"
+        end
+    end
+    -- Restore index links that were snapshotted; leave newer unrelated links alone.
+    local bak_by_name = pathJoin(bak_path, "by-name")
+    for _, norm in ipairs(listDir(bak_by_name)) do
+        for _, id in ipairs(listDir(pathJoin(bak_by_name, norm))) do
+            SyncDB.touchLink(pathJoin(root, "by-name", norm, id))
+        end
+    end
+    local bak_by_fp = pathJoin(bak_path, "by-fp")
+    for _, fp in ipairs(listDir(bak_by_fp)) do
+        for _, id in ipairs(listDir(pathJoin(bak_by_fp, fp))) do
+            SyncDB.touchLink(pathJoin(root, "by-fp", fp, id))
+        end
+    end
+    -- Drop redirects created by the merge for from_ids (backup may already lack them,
+    -- but remove again if a newer redirect reappeared).
+    for _, id in ipairs(manifest.from_ids or {}) do
+        local redirect = SyncDB.redirectPath(root, id)
+        -- Only remove if it points at the merge target.
+        local target = readAll(redirect)
+        if target and util.trim(target) == manifest.to_id then
+            os.remove(redirect)
+        end
+    end
+    return true
+end
+
+--- Merge other book_ids into canonical to_id. Creates a backup first.
+-- Marks are union-merged into to_id; from_ids get redirect entries.
+function SyncDB.mergeBooks(root, to_id, from_ids, device_id)
+    root = root or SyncDB.getLocalRoot()
+    to_id = SyncDB.resolveRedirect(root, to_id)
+    if not to_id or not from_ids or #from_ids == 0 then
+        return false, "bad_args"
+    end
+    local clean_from = {}
+    for _, id in ipairs(from_ids) do
+        id = SyncDB.resolveRedirect(root, id)
+        if id and id ~= to_id then
+            table.insert(clean_from, id)
+        end
+    end
+    if #clean_from == 0 then
+        return false, "nothing_to_merge"
+    end
+
+    local bak, berr = SyncDB.backupMerge(root, to_id, clean_from)
+    if not bak then
+        return false, berr or "backup_failed"
+    end
+
+    for _, from_id in ipairs(clean_from) do
+        -- Union-merge marks into the canonical book.
+        for _, mark in ipairs(SyncDB.listMarks(root, from_id)) do
+            SyncDB.upsertMarkFromAnnotation(root, to_id, mark, device_id)
+            -- Preserve gone/back state relative to from_id by copying latest markers.
+            local gone_n = SyncDB.latestGoneNumber(root, from_id, mark.datetime)
+            local back_n = SyncDB.latestBackNumber(root, from_id, mark.datetime)
+            if gone_n > 0 and gone_n >= back_n then
+                if not SyncDB.isMarkGone(root, to_id, mark.datetime) then
+                    SyncDB.markGone(root, to_id, mark.datetime, device_id)
+                end
+            elseif back_n > gone_n then
+                local to_gone = SyncDB.latestGoneNumber(root, to_id, mark.datetime)
+                local to_back = SyncDB.latestBackNumber(root, to_id, mark.datetime)
+                if to_gone >= to_back then
+                    SyncDB.markBack(root, to_id, mark.datetime, device_id)
+                end
+            end
+        end
+        -- Attach alternate names / fingerprints to the canonical id.
+        for _, norm in ipairs(SyncDB.namesForBook(root, from_id)) do
+            createLink(root, "by-name/" .. norm, to_id, device_id, true)
+        end
+        local by_fp = pathJoin(root, "by-fp")
+        for _, fp in ipairs(listDir(by_fp)) do
+            for _, id in ipairs(listDir(pathJoin(by_fp, fp))) do
+                if id == from_id then
+                    createLink(root, "by-fp/" .. fp, to_id, device_id, true)
+                end
+            end
+        end
+        SyncDB.setRedirect(root, from_id, to_id, device_id)
+    end
+
+    return true, bak
+end
+
 -- Keep old API stubs used during transition
 function SyncDB.getSyncFilePath(doc_path)
     local sdr_dir = DocSettings:getSidecarDir(doc_path)

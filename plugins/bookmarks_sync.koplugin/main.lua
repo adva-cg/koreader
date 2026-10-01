@@ -2,6 +2,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local MultiConfirmBox = require("ui/widget/multiconfirmbox")
+local ConfirmBox = require("ui/widget/confirmbox")
 local UIManager = require("ui/uimanager")
 local ButtonDialog = require("ui/widget/buttondialog")
 local PathChooser = require("ui/widget/pathchooser")
@@ -87,6 +88,22 @@ function BookmarkSync:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 callback = function()
                     self:showRestoreDialog()
+                end,
+            },
+            {
+                text = l("Merge with another book"),
+                help_text = l("Merge bookmarks from a differently named copy of this work into the current book. A backup is created first."),
+                keep_menu_open = true,
+                callback = function()
+                    self:showMergeBooksDialog()
+                end,
+            },
+            {
+                text = l("Restore merge backup"),
+                help_text = l("Undo a previous book merge using its backup."),
+                keep_menu_open = true,
+                callback = function()
+                    self:showRestoreMergeBackupDialog()
                 end,
             },
             {
@@ -261,6 +278,136 @@ function BookmarkSync:showRestoreDialog()
     end
     UIManager:show(ButtonDialog:new {
         title = l("Restore deleted bookmarks"),
+        buttons = buttons,
+    })
+end
+
+function BookmarkSync:showMergeBooksDialog()
+    if not self:ensureBookContext() then
+        UIManager:show(InfoMessage:new { text = l("No book is open.") })
+        return
+    end
+    local root = SyncDB.getLocalRoot()
+    local current_id = SyncDB.resolveRedirect(root, self.book_id)
+    local books = SyncDB.listBookSummaries(root)
+    local buttons = {}
+    for _, book in ipairs(books) do
+        if book.book_id ~= current_id then
+            local label = book.label
+            if #label > 70 then
+                label = label:sub(1, 67) .. "…"
+            end
+            local from_id = book.book_id
+            table.insert(buttons, { {
+                text = label,
+                callback = function()
+                    UIManager:show(ConfirmBox:new {
+                        text = T(l("Merge bookmarks from:\n%1\n\ninto the current book?\nA backup will be created first."), book.label),
+                        ok_text = l("Merge"),
+                        ok_callback = function()
+                            local ok, bak_or_err = SyncDB.mergeBooks(root, current_id, { from_id }, self.device_id)
+                            if not ok then
+                                UIManager:show(InfoMessage:new {
+                                    text = T(l("Merge failed: %1"), tostring(bak_or_err)),
+                                    timeout = 4,
+                                })
+                                return
+                            end
+                            self.book_id = current_id
+                            self._book_ready = true
+                            UIManager:show(InfoMessage:new {
+                                text = T(l("Books merged.\nBackup:\n%1"), bak_or_err),
+                                timeout = 5,
+                            })
+                            UIManager:nextTick(function()
+                                self:importExternalBookmarks()
+                            end)
+                        end,
+                    })
+                end,
+            } })
+        end
+    end
+    if #buttons == 0 then
+        UIManager:show(InfoMessage:new {
+            text = l("No other books found in the bookmark store."),
+            timeout = 3,
+        })
+        return
+    end
+    UIManager:show(ButtonDialog:new {
+        title = l("Merge into current book"),
+        buttons = buttons,
+    })
+end
+
+function BookmarkSync:showRestoreMergeBackupDialog()
+    local root = SyncDB.getLocalRoot()
+    local backups = SyncDB.listMergeBackups(root)
+    if #backups == 0 then
+        UIManager:show(InfoMessage:new {
+            text = l("No merge backups found."),
+            timeout = 3,
+        })
+        return
+    end
+    local buttons = {}
+    for _, bak in ipairs(backups) do
+        local from_labels = {}
+        for _, id in ipairs(bak.from_ids) do
+            local names = {}
+            local by_name_dir = bak.path .. "/by-name"
+            if lfs.attributes(by_name_dir, "mode") == "directory" then
+                for name in lfs.dir(by_name_dir) do
+                    if name ~= "." and name ~= ".."
+                        and lfs.attributes(by_name_dir .. "/" .. name .. "/" .. id, "mode") then
+                        table.insert(names, name)
+                    end
+                end
+            end
+            if #names == 0 then
+                names = SyncDB.namesForBook(root, id)
+            end
+            table.insert(from_labels, #names > 0 and names[1] or id:sub(1, 8))
+        end
+        local label = T(l("%1 ← %2"), bak.time, table.concat(from_labels, ", "))
+        if #label > 70 then
+            label = label:sub(1, 67) .. "…"
+        end
+        local bak_path = bak.path
+        table.insert(buttons, { {
+            text = label,
+            callback = function()
+                UIManager:show(ConfirmBox:new {
+                    text = T(l("Restore merge backup from %1?\nCurrent merge state for these books will be overwritten."), bak.time),
+                    ok_text = l("Restore"),
+                    ok_callback = function()
+                        local ok, err = SyncDB.restoreMergeBackup(root, bak_path)
+                        if not ok then
+                            UIManager:show(InfoMessage:new {
+                                text = T(l("Restore failed: %1"), tostring(err)),
+                                timeout = 4,
+                            })
+                            return
+                        end
+                        self._book_ready = false
+                        UIManager:show(InfoMessage:new {
+                            text = l("Merge backup restored."),
+                            timeout = 3,
+                        })
+                        if self.ui.document and self.ui.document.file then
+                            UIManager:nextTick(function()
+                                self:ensureBookContext()
+                                self:importExternalBookmarks()
+                            end)
+                        end
+                    end,
+                })
+            end,
+        } })
+    end
+    UIManager:show(ButtonDialog:new {
+        title = l("Restore merge backup"),
         buttons = buttons,
     })
 end
