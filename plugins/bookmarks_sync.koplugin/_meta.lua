@@ -4,4 +4,5 @@ return {
     title = _("Bookmarks Sync"),
     description = _("Backs up and normalizes bookmarks for cross-format sync."),
     type = "reader",
+    version = "0.2.0",
 }

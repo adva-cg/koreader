@@ -15,6 +15,8 @@ local T = require("ffi/util").template
 local Anchoring = require("anchoring")
 local SyncDB = require("sync_db")
 
+local AUTO_SHARED_SETTING = "bookmarks_sync_auto_shared"
+
 local BookmarkSync = WidgetContainer:extend {
     name = "bookmarks_sync",
     title = l("Bookmarks Sync"),
@@ -26,6 +28,7 @@ local BookmarkSync = WidgetContainer:extend {
     _is_importing = false,
     _book_ready = false,
     _shared_syncing = false,
+    _exporting = false,
 }
 
 function BookmarkSync:init()
@@ -34,6 +37,21 @@ function BookmarkSync:init()
     if not self.device_id then
         self.device_id = require("random").uuid()
         G_reader_settings:saveSetting("device_id", self.device_id)
+    end
+    -- Stable callback references for UIManager:unschedule
+    self._runScheduledSharedSync = function()
+        local opts = self._scheduled_shared_opts or { quiet = true }
+        self._scheduled_shared_opts = nil
+        Trapper:wrap(function()
+            self:syncSharedFolder(opts)
+        end)
+    end
+    self._runScheduledLocalThenShared = function()
+        local opts = self._scheduled_local_opts or { quiet = true }
+        self._scheduled_local_opts = nil
+        Trapper:wrap(function()
+            self:syncLocalThenShared(opts)
+        end)
     end
 end
 
@@ -45,22 +63,23 @@ function BookmarkSync:addToMainMenu(menu_items)
                 text = l("Sync highlights and bookmarks now"),
                 keep_menu_open = false,
                 callback = function()
-                    self:syncLocalThenShared({ quiet = true, after_import = true })
-                    if not SyncDB.getSharedRoot() then
-                        self:importExternalBookmarks()
-                    end
-                    UIManager:show(InfoMessage:new {
-                        text = l("Bookmarks sync completed successfully."),
-                        timeout = 3,
-                    })
+                    Trapper:wrap(function()
+                        self:syncLocalThenShared({ quiet = true, after_import = true })
+                        UIManager:show(InfoMessage:new {
+                            text = l("Bookmarks sync completed successfully."),
+                            timeout = 3,
+                        })
+                    end)
                 end,
             },
             {
                 text = l("Sync shared folder"),
-                help_text = l("Merge the local bookmark store with the Syncthing folder."),
+                help_text = l("Merge the local bookmark store with the shared folder."),
                 keep_menu_open = false,
                 callback = function()
-                    self:syncSharedFolder({ quiet = false, after_import = true })
+                    Trapper:wrap(function()
+                        self:syncSharedFolder({ quiet = false, after_import = true })
+                    end)
                 end,
             },
             {
@@ -88,22 +107,52 @@ function BookmarkSync:addToMainMenu(menu_items)
 end
 
 function BookmarkSync:getSettingsMenu()
-    local shared = SyncDB.getSharedRoot() or G_reader_settings:readSetting("bookmarks_sync_shared_path")
     return {
         {
-            text = l("Shared folder (Syncthing)"),
-            sub_text_func = function()
-                return shared or l("Not set")
+            text_func = function()
+                local path = G_reader_settings:readSetting("bookmarks_sync_shared_path")
+                if not path or path == "" then
+                    return l("Shared folder: Not set")
+                end
+                if SyncDB.getSharedRoot() then
+                    return T(l("Shared folder: %1"), path)
+                end
+                return T(l("Shared folder: %1 (unavailable)"), path)
             end,
             keep_menu_open = true,
-            callback = function()
-                self:chooseSharedFolder()
+            callback = function(touchmenu_instance)
+                self:chooseSharedFolder(touchmenu_instance)
+            end,
+        },
+        {
+            text = l("Auto-sync shared folder"),
+            help_text = l("When enabled, sync the shared folder whenever local bookmarks are saved, if the folder is available."),
+            checked_func = function()
+                return self:isAutoSharedEnabled()
+            end,
+            enabled_func = function()
+                return G_reader_settings:readSetting("bookmarks_sync_shared_path") ~= nil
+            end,
+            callback = function(touchmenu_instance)
+                local enabled = not self:isAutoSharedEnabled()
+                G_reader_settings:saveSetting(AUTO_SHARED_SETTING, enabled)
+                if touchmenu_instance then
+                    touchmenu_instance:updateItems()
+                end
             end,
         },
     }
 end
 
-function BookmarkSync:chooseSharedFolder()
+function BookmarkSync:isAutoSharedEnabled()
+    local value = G_reader_settings:readSetting(AUTO_SHARED_SETTING)
+    if value == nil then
+        return false
+    end
+    return value and true or false
+end
+
+function BookmarkSync:chooseSharedFolder(touchmenu_instance)
     local start = SyncDB.getSharedRoot()
         or G_reader_settings:readSetting("bookmarks_sync_shared_path")
         or G_reader_settings:readSetting("home_dir")
@@ -113,6 +162,9 @@ function BookmarkSync:chooseSharedFolder()
         path = start,
         onConfirm = function(path)
             SyncDB.setSharedRoot(path)
+            if touchmenu_instance then
+                touchmenu_instance:updateItems()
+            end
             UIManager:show(InfoMessage:new {
                 text = T(l("Shared folder set to:\n%1"), path),
                 timeout = 3,
@@ -290,7 +342,8 @@ function BookmarkSync:applyConflictChoice(conflict)
     end
 end
 
---- Sync with the shared Syncthing folder.
+--- Sync with the shared folder in a subprocess so the UI stays responsive.
+-- Settings that live in memory (cursor/pending) are returned from the child and applied here.
 -- @param opts.quiet if true, skip toasts when folder is missing/unavailable; still ask on conflicts
 -- @param opts.after_import if true, import bookmarks after a successful push
 function BookmarkSync:syncSharedFolder(opts)
@@ -305,7 +358,7 @@ function BookmarkSync:syncSharedFolder(opts)
             UIManager:show(InfoMessage:new {
                 text = configured
                     and l("Shared folder is not available.")
-                    or l("Set the shared Syncthing folder in Bookmarks Sync settings first."),
+                    or l("Set the shared folder in Bookmarks Sync settings first."),
                 timeout = 4,
             })
         end
@@ -313,16 +366,67 @@ function BookmarkSync:syncSharedFolder(opts)
     end
 
     self._shared_syncing = true
-    local pending_conflicts = {}
-    local ok, err = SyncDB.pullShared(self.device_id, function(conflict)
-        table.insert(pending_conflicts, conflict)
-        return nil -- defer choice
-    end)
-    if not ok then
+    local device_id = self.device_id
+    local trap = quiet and nil or l("Syncing shared folder… (tap to cancel)")
+    local completed, result = Trapper:dismissableRunInSubprocess(function()
+        local conflicts = {}
+        local ok, err = SyncDB.pullShared(device_id, function(conflict)
+            -- Only plain tables cross the subprocess boundary.
+            table.insert(conflicts, {
+                kind = conflict.kind,
+                rel = conflict.rel,
+                local_data = conflict.local_data,
+                remote_data = conflict.remote_data,
+                conflict_path = conflict.conflict_path,
+            })
+            return nil
+        end)
+        if not ok then
+            return {
+                ok = false,
+                err = err,
+                cursor = SyncDB.getCursor(),
+                pending = G_reader_settings:readSetting("bookmarks_sync_pending") or {},
+            }
+        end
+        local pushed, perr = true, nil
+        if #conflicts == 0 then
+            pushed, perr = SyncDB.pushShared(device_id)
+        end
+        return {
+            ok = true,
+            conflicts = conflicts,
+            pushed = pushed,
+            perr = perr,
+            cursor = SyncDB.getCursor(),
+            pending = G_reader_settings:readSetting("bookmarks_sync_pending") or {},
+        }
+    end, trap)
+
+    if not completed then
         self._shared_syncing = false
         if not quiet then
             UIManager:show(InfoMessage:new {
-                text = err == "no_shared"
+                text = l("Shared folder sync cancelled."),
+                timeout = 2,
+            })
+        end
+        return
+    end
+
+    result = result or {}
+    if result.cursor ~= nil then
+        SyncDB.setCursor(result.cursor)
+    end
+    if result.pending then
+        G_reader_settings:saveSetting("bookmarks_sync_pending", result.pending)
+    end
+
+    if not result.ok then
+        self._shared_syncing = false
+        if not quiet then
+            UIManager:show(InfoMessage:new {
+                text = result.err == "no_shared"
                     and l("Shared folder is not available.")
                     or l("Could not read the shared folder."),
                 timeout = 4,
@@ -331,20 +435,54 @@ function BookmarkSync:syncSharedFolder(opts)
         return
     end
 
+    local pending_conflicts = result.conflicts or {}
+
     local function finish_push()
-        local pushed, perr = SyncDB.pushShared(self.device_id)
-        self._shared_syncing = false
-        if not pushed then
-            if not quiet then
-                UIManager:show(InfoMessage:new {
-                    text = perr == "no_shared"
-                        and l("Shared folder is not available.")
-                        or l("Could not update the shared folder."),
-                    timeout = 4,
-                })
+        if #pending_conflicts > 0 then
+            -- Conflicts were resolved on the UI thread; push remaining pending quietly in background.
+            local push_done, push_result = Trapper:dismissableRunInSubprocess(function()
+                local pushed, perr = SyncDB.pushShared(device_id)
+                return {
+                    pushed = pushed,
+                    perr = perr,
+                    cursor = SyncDB.getCursor(),
+                    pending = G_reader_settings:readSetting("bookmarks_sync_pending") or {},
+                }
+            end, quiet and nil or l("Updating shared folder… (tap to cancel)"))
+            self._shared_syncing = false
+            if not push_done then
+                return
             end
-            return
+            if push_result then
+                if push_result.cursor ~= nil then
+                    SyncDB.setCursor(push_result.cursor)
+                end
+                if push_result.pending then
+                    G_reader_settings:saveSetting("bookmarks_sync_pending", push_result.pending)
+                end
+                if not push_result.pushed and not quiet then
+                    UIManager:show(InfoMessage:new {
+                        text = l("Could not update the shared folder."),
+                        timeout = 4,
+                    })
+                    return
+                end
+            end
+        else
+            self._shared_syncing = false
+            if result.pushed == false then
+                if not quiet then
+                    UIManager:show(InfoMessage:new {
+                        text = result.perr == "no_shared"
+                            and l("Shared folder is not available.")
+                            or l("Could not update the shared folder."),
+                        timeout = 4,
+                    })
+                end
+                return
+            end
         end
+
         if not quiet then
             UIManager:show(InfoMessage:new {
                 text = l("Shared folder sync finished."),
@@ -365,13 +503,81 @@ function BookmarkSync:syncSharedFolder(opts)
     end
 end
 
+function BookmarkSync:scheduleSharedSync(opts)
+    self._scheduled_shared_opts = opts or { quiet = true }
+    UIManager:unschedule(self._runScheduledSharedSync)
+    -- Debounce so typing/highlight bursts don't stall the UI.
+    UIManager:scheduleIn(10, self._runScheduledSharedSync)
+end
+
+function BookmarkSync:scheduleLocalThenShared(opts)
+    self._scheduled_local_opts = opts or { quiet = true }
+    UIManager:unschedule(self._runScheduledLocalThenShared)
+    UIManager:scheduleIn(10, self._runScheduledLocalThenShared)
+end
+
+function BookmarkSync:applyChildSyncState(result)
+    if not result then return end
+    if result.cursor ~= nil then
+        SyncDB.setCursor(result.cursor)
+    end
+    if result.pending then
+        G_reader_settings:saveSetting("bookmarks_sync_pending", result.pending)
+    end
+end
+
+--- Run local export in a subprocess so anchor extraction does not freeze the UI.
+function BookmarkSync:exportLocalBookmarksBackground(opts)
+    opts = opts or {}
+    if self._exporting then
+        return false
+    end
+    if not self:ensureBookContext() then
+        return false
+    end
+    local doc = self.ui.document
+    local total_pages = doc and doc:getPageCount()
+    if not total_pages or total_pages <= 0 then
+        return false
+    end
+
+    self._exporting = true
+    local trap = opts.quiet and nil or l("Saving bookmarks… (tap to cancel)")
+    local completed, result = Trapper:dismissableRunInSubprocess(function()
+        self:exportLocalBookmarks()
+        return {
+            ok = true,
+            cursor = SyncDB.getCursor(),
+            pending = G_reader_settings:readSetting("bookmarks_sync_pending") or {},
+        }
+    end, trap)
+    self._exporting = false
+
+    if not completed then
+        return false
+    end
+    self:applyChildSyncState(result)
+    return true
+end
+
 function BookmarkSync:syncLocalThenShared(opts)
     opts = opts or {}
-    self:exportLocalBookmarks()
-    self:syncSharedFolder({
-        quiet = opts.quiet ~= false,
-        after_import = opts.after_import,
-    })
+    self:exportLocalBookmarksBackground({ quiet = opts.quiet ~= false })
+    local shared_ok = SyncDB.getSharedRoot()
+        and (opts.force_shared or self:isAutoSharedEnabled())
+    if shared_ok then
+        local shared_opts = {
+            quiet = opts.quiet ~= false,
+            after_import = opts.after_import,
+        }
+        if shared_opts.quiet then
+            self:scheduleSharedSync(shared_opts)
+        else
+            self:syncSharedFolder(shared_opts)
+        end
+    elseif opts.after_import then
+        self:importExternalBookmarks()
+    end
 end
 
 function BookmarkSync:onReaderReady()
@@ -383,17 +589,12 @@ function BookmarkSync:onReaderReady()
     end
     self._book_ready = false
     if not self:ensureBookContext() then return end
-    self:syncLocalThenShared({ quiet = true, after_import = true })
-    if not SyncDB.getSharedRoot() then
-        UIManager:nextTick(function()
-            self:importExternalBookmarks()
-        end)
-    end
+    self:scheduleLocalThenShared({ quiet = true, after_import = true })
 end
 
 function BookmarkSync:onSaveSettings()
     logger.dbg("bookmarks_sync: onSaveSettings triggered. Exporting local bookmarks.")
-    self:syncLocalThenShared({ quiet = true })
+    self:scheduleLocalThenShared({ quiet = true })
 end
 
 function BookmarkSync:onAnnotationsModified(event)
@@ -401,9 +602,7 @@ function BookmarkSync:onAnnotationsModified(event)
         logger.dbg("bookmarks_sync: onAnnotationsModified skipped during import.")
         return
     end
-    UIManager:nextTick(function()
-        self:syncLocalThenShared({ quiet = true })
-    end)
+    self:scheduleLocalThenShared({ quiet = true })
 end
 
 function BookmarkSync:exportLocalBookmarks()
