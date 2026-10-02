@@ -195,9 +195,7 @@ end
 function BookmarkSync:ensureBookContext()
     local doc = self.ui.document
     if not doc or not doc.file then return false end
-    if self._book_ready and self.book_id and self.partial_md5 then
-        return true
-    end
+    -- Always run resolveBook so wiped by-fp / by-name links are recreated.
     SyncDB.migrateSidecar(doc.file, self.device_id)
     local book_id, fp, format = SyncDB.resolveBook(doc.file, self.device_id)
     if not book_id then return false end

@@ -411,6 +411,7 @@ function SyncDB.relatedBookIds(root, book_id)
 end
 
 --- Resolve or create book_id for an open document.
+-- Always (re)ensures by-fp / by-name index links so a wiped shared/local index can heal.
 -- @return book_id, partial_md5, format, is_new_fingerprint
 function SyncDB.resolveBook(doc_path, device_id, root)
     root = root or SyncDB.getLocalRoot()
@@ -424,27 +425,29 @@ function SyncDB.resolveBook(doc_path, device_id, root)
     local norm = SyncDB.normalizeName(base)
 
     local existing = bookIdForFp(root, fp)
-    if existing then
-        return existing, fp, format, false
-    end
-
-    local ids = norm ~= "" and bookIdsForName(root, norm) or {}
     local book_id
     local is_new_fp = true
-    if #ids == 0 then
-        book_id = random.uuid()
-    elseif #ids == 1 then
-        book_id = SyncDB.resolveRedirect(root, ids[1])
+    if existing then
+        book_id = existing
+        is_new_fp = false
     else
-        book_id = SyncDB.resolveRedirect(root, canonicalByJournal(root, norm, ids))
-        for _, id in ipairs(ids) do
-            local resolved = SyncDB.resolveRedirect(root, id)
-            if resolved ~= book_id then
-                SyncDB.setRedirect(root, id, book_id, device_id)
+        local ids = norm ~= "" and bookIdsForName(root, norm) or {}
+        if #ids == 0 then
+            book_id = random.uuid()
+        elseif #ids == 1 then
+            book_id = SyncDB.resolveRedirect(root, ids[1])
+        else
+            book_id = SyncDB.resolveRedirect(root, canonicalByJournal(root, norm, ids))
+            for _, id in ipairs(ids) do
+                local resolved = SyncDB.resolveRedirect(root, id)
+                if resolved ~= book_id then
+                    SyncDB.setRedirect(root, id, book_id, device_id)
+                end
             end
         end
     end
 
+    -- (Re)create index links even when book_id already known (e.g. after a wiped sync folder).
     createLink(root, "by-fp/" .. fp, book_id, device_id, true)
     if norm ~= "" then
         createLink(root, "by-name/" .. norm, book_id, device_id, true)
