@@ -508,6 +508,7 @@ function SyncDB.writeMark(root, book_id, mark_data, device_id, journalize)
 end
 
 --- Upsert mark content from local annotation export.
+-- Skips journaling when nothing changed (avoids shared-folder rewrite loops).
 function SyncDB.upsertMarkFromAnnotation(root, book_id, mark_data, device_id)
     book_id = SyncDB.resolveRedirect(root, book_id)
     local path = SyncDB.markPath(root, book_id, mark_data.datetime)
@@ -520,6 +521,9 @@ function SyncDB.upsertMarkFromAnnotation(root, book_id, mark_data, device_id)
     end
     out.datetime = mark_data.datetime
     out.loc = SyncDB.mergeLoc(existing.loc or {}, mark_data.loc)
+    if existing.datetime and marksEqual(existing, out) then
+        return false
+    end
     return SyncDB.writeMark(root, book_id, out, device_id, true)
 end
 
@@ -869,8 +873,38 @@ function SyncDB.pullShared(device_id, conflict_cb)
     return true, max_applied
 end
 
+--- Copy by-name / by-fp index links for the open book if missing on shared.
+-- Only the open book (no full index walk).
+local function ensureOpenBookIndexOnShared(local_root, shared_root, device_id, book_id, partial_md5, norm_name)
+    if not book_id then return 0 end
+    book_id = SyncDB.resolveRedirect(local_root, book_id)
+    local copied = 0
+    local function ensureRel(rel)
+        local src = pathJoin(local_root, rel)
+        local dst = pathJoin(shared_root, rel)
+        if lfs.attributes(src, "mode") == "file" and lfs.attributes(dst, "mode") ~= "file" then
+            if copyFile(src, dst) then
+                local num = SyncDB.appendJournal(shared_root, rel, device_id)
+                if num > SyncDB.getCursor() then
+                    SyncDB.setCursor(num)
+                end
+                copied = copied + 1
+            end
+        end
+    end
+    if partial_md5 and partial_md5 ~= "" then
+        ensureRel("by-fp/" .. partial_md5 .. "/" .. book_id)
+    end
+    if norm_name and norm_name ~= "" then
+        ensureRel("by-name/" .. norm_name .. "/" .. book_id)
+    end
+    return copied
+end
+
 --- Push pending local paths into the shared folder with new journal numbers.
-function SyncDB.pushShared(device_id)
+-- @param opts.book_id / opts.partial_md5 / opts.norm_name optional open-book index heal
+function SyncDB.pushShared(device_id, opts)
+    opts = opts or {}
     local local_root = SyncDB.getLocalRoot()
     local shared_root = SyncDB.getSharedRoot()
     if not shared_root then
@@ -881,6 +915,14 @@ function SyncDB.pushShared(device_id)
         SyncDB.setCursor(SyncDB.getMaxJournalNumber(local_root))
         return true, "same_root"
     end
+    ensureOpenBookIndexOnShared(
+        local_root,
+        shared_root,
+        device_id,
+        opts.book_id,
+        opts.partial_md5,
+        opts.norm_name
+    )
 
     local pending = loadPending()
     local remain = {}
@@ -916,10 +958,10 @@ function SyncDB.pushShared(device_id)
     return true, #pending - #remain
 end
 
-function SyncDB.syncShared(device_id, conflict_cb)
+function SyncDB.syncShared(device_id, conflict_cb, opts)
     local ok, err = SyncDB.pullShared(device_id, conflict_cb)
     if not ok then return false, err end
-    return SyncDB.pushShared(device_id)
+    return SyncDB.pushShared(device_id, opts)
 end
 
 --- One-time migration from sidecar bookmarks_sync.lua

@@ -32,6 +32,7 @@ local BookmarkSync = WidgetContainer:extend {
     _book_ready = false,
     _shared_syncing = false,
     _exporting = false,
+    _sync_hold = false,
 }
 
 function BookmarkSync:init()
@@ -514,6 +515,14 @@ function BookmarkSync:syncSharedFolder(opts)
 
     self._shared_syncing = true
     local device_id = self.device_id
+    self:ensureBookContext()
+    local push_opts = {
+        book_id = self.book_id,
+        partial_md5 = self.partial_md5,
+        norm_name = self.ui.document and self.ui.document.file
+            and SyncDB.normalizeName(SyncDB.getBaseName(self.ui.document.file))
+            or nil,
+    }
     local trap = quiet and nil or l("Syncing shared folder… (tap to cancel)")
     local completed, result = Trapper:dismissableRunInSubprocess(function()
         local conflicts = {}
@@ -538,7 +547,7 @@ function BookmarkSync:syncSharedFolder(opts)
         end
         local pushed, perr = true, nil
         if #conflicts == 0 then
-            pushed, perr = SyncDB.pushShared(device_id)
+            pushed, perr = SyncDB.pushShared(device_id, push_opts)
         end
         return {
             ok = true,
@@ -588,7 +597,7 @@ function BookmarkSync:syncSharedFolder(opts)
         if #pending_conflicts > 0 then
             -- Conflicts were resolved on the UI thread; push remaining pending quietly in background.
             local push_done, push_result = Trapper:dismissableRunInSubprocess(function()
-                local pushed, perr = SyncDB.pushShared(device_id)
+                local pushed, perr = SyncDB.pushShared(device_id, push_opts)
                 return {
                     pushed = pushed,
                     perr = perr,
@@ -661,6 +670,21 @@ function BookmarkSync:scheduleLocalThenShared(opts)
     self._scheduled_local_opts = opts or { quiet = true }
     UIManager:unschedule(self._runScheduledLocalThenShared)
     UIManager:scheduleIn(10, self._runScheduledLocalThenShared)
+end
+
+function BookmarkSync:holdSync(sec)
+    self._sync_hold = true
+    UIManager:unschedule(self._releaseSyncHold)
+    if not self._releaseSyncHold then
+        self._releaseSyncHold = function()
+            self._sync_hold = false
+        end
+    end
+    UIManager:scheduleIn(sec or 5, self._releaseSyncHold)
+end
+
+function BookmarkSync:shouldSkipAutoSync()
+    return self._is_importing or self._exporting or self._shared_syncing or self._sync_hold
 end
 
 function BookmarkSync:applyChildSyncState(result)
@@ -858,6 +882,7 @@ function BookmarkSync:exportLocalBookmarksBackground(opts)
         UIManager:close(info)
     end
     self._exporting = false
+    self:holdSync(5)
     return not cancelled
 end
 
@@ -895,12 +920,16 @@ end
 
 function BookmarkSync:onSaveSettings()
     logger.dbg("bookmarks_sync: onSaveSettings triggered. Exporting local bookmarks.")
+    if self:shouldSkipAutoSync() then
+        logger.dbg("bookmarks_sync: onSaveSettings skipped (sync hold).")
+        return
+    end
     self:scheduleLocalThenShared({ quiet = true })
 end
 
 function BookmarkSync:onAnnotationsModified(event)
-    if self._is_importing then
-        logger.dbg("bookmarks_sync: onAnnotationsModified skipped during import.")
+    if self:shouldSkipAutoSync() then
+        logger.dbg("bookmarks_sync: onAnnotationsModified skipped during sync/hold.")
         return
     end
     self:scheduleLocalThenShared({ quiet = true })
@@ -1123,6 +1152,7 @@ function BookmarkSync:importExternalBookmarks()
         end
 
         UIManager:close(info)
+        self:holdSync(8)
 
         local is_reflowable = not (doc.is_pdf or doc.is_djvu)
         if #unfound_bookmarks > 0 then
