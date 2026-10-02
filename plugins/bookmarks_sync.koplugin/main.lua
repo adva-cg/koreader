@@ -17,6 +17,8 @@ local Anchoring = require("anchoring")
 local SyncDB = require("sync_db")
 
 local AUTO_SHARED_SETTING = "bookmarks_sync_auto_shared"
+local BATCH_SIZE = 10
+local BATCH_PAUSE_SEC = 0.25
 
 local BookmarkSync = WidgetContainer:extend {
     name = "bookmarks_sync",
@@ -673,7 +675,102 @@ function BookmarkSync:applyChildSyncState(result)
     end
 end
 
---- Run local export in a subprocess so anchor extraction does not freeze the UI.
+--- Yield briefly so the UI can breathe between batches (requires Trapper:wrap).
+function BookmarkSync:yieldPause(sec)
+    local co = coroutine.running()
+    if not co then return end
+    UIManager:scheduleIn(sec or BATCH_PAUSE_SEC, function()
+        coroutine.resume(co)
+    end)
+    coroutine.yield()
+end
+
+local function childSyncState()
+    return {
+        ok = true,
+        cursor = SyncDB.getCursor(),
+        pending = G_reader_settings:readSetting("bookmarks_sync_pending") or {},
+    }
+end
+
+--- Export a list of annotation items into the store (used inside a subprocess).
+function BookmarkSync:exportAnnotationItems(items)
+    local doc = self.ui.document
+    local total_pages = doc:getPageCount()
+    if not total_pages or total_pages <= 0 then return end
+    local root = SyncDB.getLocalRoot()
+    local is_reflowable = not (doc.is_pdf or doc.is_djvu)
+    for _, item in ipairs(items) do
+        pcall(function()
+            local exact, prefix, suffix = Anchoring.getAnchorContext(doc, item, 5)
+            local pageno = is_reflowable and doc:getPageFromXPointer(item.page) or item.pageno
+            local progress = (pageno or 0) / total_pages
+            local loc = {
+                [self.partial_md5] = {
+                    format = self.format,
+                    pos0 = item.pos0,
+                    pos1 = item.pos1,
+                    page = item.page,
+                    pageno = item.pageno,
+                    pboxes = item.pboxes,
+                },
+            }
+            SyncDB.upsertMarkFromAnnotation(root, self.book_id, {
+                datetime = item.datetime,
+                progress = progress,
+                exact = exact,
+                prefix = prefix,
+                suffix = suffix,
+                drawer = item.drawer,
+                color = item.color,
+                notes = item.note or item.notes,
+                loc = loc,
+            }, self.device_id)
+            if not SyncDB.isSeen(root, self.book_id, item.datetime, self.device_id, self.partial_md5) then
+                SyncDB.markSeen(root, self.book_id, item.datetime, self.device_id, self.partial_md5)
+            end
+        end)
+    end
+end
+
+--- Mark store entries gone when they disappeared from the open book.
+function BookmarkSync:exportMarkGonePass(current_datetimes)
+    local root = SyncDB.getLocalRoot()
+    for _, mark in ipairs(SyncDB.listMarks(root, self.book_id)) do
+        if not current_datetimes[mark.datetime] then
+            local gone = SyncDB.isMarkGone(root, self.book_id, mark.datetime)
+            local seen = SyncDB.isSeen(root, self.book_id, mark.datetime, self.device_id, self.partial_md5)
+            local has_loc = mark.loc and mark.loc[self.partial_md5]
+            if gone == false and seen and has_loc then
+                SyncDB.markGone(root, self.book_id, mark.datetime, self.device_id)
+                logger.dbg("bookmarks_sync: Marking bookmark as gone:", mark.datetime)
+            end
+        end
+    end
+end
+
+--- Full export (blocking). Prefer exportLocalBookmarksBackground from UI paths.
+function BookmarkSync:exportLocalBookmarks()
+    logger.dbg("bookmarks_sync: exportLocalBookmarks started.")
+    if not self:ensureBookContext() then return end
+    local doc = self.ui.document
+    local total_pages = doc:getPageCount()
+    if not total_pages or total_pages <= 0 then return end
+    local annotations = self.ui.annotation.annotations or {}
+    local work = {}
+    local current_datetimes = {}
+    for _, item in ipairs(annotations) do
+        if item.datetime and not item.deleted and not item.is_service_note then
+            current_datetimes[item.datetime] = true
+            table.insert(work, item)
+        end
+    end
+    self:exportAnnotationItems(work)
+    self:exportMarkGonePass(current_datetimes)
+    logger.dbg("bookmarks_sync: exportLocalBookmarks finished.")
+end
+
+--- Export in batches of BATCH_SIZE. Finished batches stay saved if the user cancels.
 function BookmarkSync:exportLocalBookmarksBackground(opts)
     opts = opts or {}
     if self._exporting then
@@ -688,23 +785,82 @@ function BookmarkSync:exportLocalBookmarksBackground(opts)
         return false
     end
 
-    self._exporting = true
-    local trap = opts.quiet and nil or l("Saving bookmarks… (tap to cancel)")
-    local completed, result = Trapper:dismissableRunInSubprocess(function()
-        self:exportLocalBookmarks()
-        return {
-            ok = true,
-            cursor = SyncDB.getCursor(),
-            pending = G_reader_settings:readSetting("bookmarks_sync_pending") or {},
-        }
-    end, trap)
-    self._exporting = false
-
-    if not completed then
-        return false
+    local annotations = self.ui.annotation.annotations or {}
+    local work = {}
+    local current_datetimes = {}
+    for _, item in ipairs(annotations) do
+        if item.datetime and not item.deleted and not item.is_service_note then
+            current_datetimes[item.datetime] = true
+            table.insert(work, item)
+        end
     end
-    self:applyChildSyncState(result)
-    return true
+
+    self._exporting = true
+    local quiet = opts.quiet
+    local total = #work
+    local info
+    if not quiet then
+        info = InfoMessage:new {
+            text = T(l("Saving bookmarks… 0/%1 (tap to cancel)"), total),
+        }
+        UIManager:show(info)
+        UIManager:forceRePaint()
+    end
+    local trap = info or nil
+
+    local cancelled = false
+    local done = 0
+    local offset = 1
+    while offset <= total do
+        local chunk = {}
+        for i = offset, math.min(offset + BATCH_SIZE - 1, total) do
+            table.insert(chunk, work[i])
+        end
+        if info then
+            UIManager:close(info)
+            info = InfoMessage:new {
+                text = T(l("Saving bookmarks… %1/%2 (tap to cancel)"), done, total),
+            }
+            UIManager:show(info)
+            UIManager:forceRePaint()
+            trap = info
+        end
+        local chunk_items = chunk
+        local completed, result = Trapper:dismissableRunInSubprocess(function()
+            self:exportAnnotationItems(chunk_items)
+            return childSyncState()
+        end, trap)
+        if completed then
+            self:applyChildSyncState(result)
+            done = done + #chunk
+            offset = offset + BATCH_SIZE
+            if offset <= total then
+                self:yieldPause(BATCH_PAUSE_SEC)
+            end
+        else
+            cancelled = true
+            logger.info("bookmarks_sync: Export cancelled after", done, "of", total)
+            break
+        end
+    end
+
+    if not cancelled then
+        local completed, result = Trapper:dismissableRunInSubprocess(function()
+            self:exportMarkGonePass(current_datetimes)
+            return childSyncState()
+        end, trap)
+        if completed then
+            self:applyChildSyncState(result)
+        else
+            cancelled = true
+        end
+    end
+
+    if info then
+        UIManager:close(info)
+    end
+    self._exporting = false
+    return not cancelled
 end
 
 function BookmarkSync:syncLocalThenShared(opts)
@@ -752,71 +908,120 @@ function BookmarkSync:onAnnotationsModified(event)
     self:scheduleLocalThenShared({ quiet = true })
 end
 
-function BookmarkSync:exportLocalBookmarks()
-    logger.dbg("bookmarks_sync: exportLocalBookmarks started.")
-    if not self:ensureBookContext() then return end
+--- Apply found import results to the open book (main process).
+function BookmarkSync:applyImportFound(found_bookmarks, local_by_datetime)
     local doc = self.ui.document
-    local total_pages = doc:getPageCount()
-    if not total_pages or total_pages <= 0 then return end
-
     local root = SyncDB.getLocalRoot()
-    local annotations = self.ui.annotation.annotations or {}
-    local current_datetimes = {}
     local is_reflowable = not (doc.is_pdf or doc.is_djvu)
-
-    for i, item in ipairs(annotations) do
-        if item.datetime and not item.deleted and not item.is_service_note then
-            current_datetimes[item.datetime] = true
-            pcall(function()
-                local exact, prefix, suffix = Anchoring.getAnchorContext(doc, item, 5)
-                local pageno = is_reflowable and doc:getPageFromXPointer(item.page) or item.pageno
-                local progress = pageno / total_pages
-                local loc = {
-                    [self.partial_md5] = {
-                        format = self.format,
-                        pos0 = item.pos0,
-                        pos1 = item.pos1,
-                        page = item.page,
-                        pageno = item.pageno,
-                        pboxes = item.pboxes,
-                    },
+    local imported_count = 0
+    self._is_importing = true
+    for _, item_data in ipairs(found_bookmarks) do
+        if not local_by_datetime[item_data.datetime] then
+            if item_data.drawer then
+                local item = {
+                    pos0 = item_data.pos0,
+                    pos1 = item_data.pos1,
+                    text = item_data.exact,
+                    datetime = item_data.datetime or os.date("%Y-%m-%d %H:%M:%S"),
+                    drawer = item_data.drawer,
+                    color = item_data.color,
+                    notes = item_data.notes,
+                    chapter = self.ui.toc:getTocTitleByPage(item_data.page),
                 }
-                SyncDB.upsertMarkFromAnnotation(root, self.book_id, {
-                    datetime = item.datetime,
-                    progress = progress,
-                    exact = exact,
-                    prefix = prefix,
-                    suffix = suffix,
-                    drawer = item.drawer,
-                    color = item.color,
-                    notes = item.note or item.notes,
-                    loc = loc,
-                }, self.device_id)
-                -- Local annotation present counts as seen for this fingerprint.
-                if not SyncDB.isSeen(root, self.book_id, item.datetime, self.device_id, self.partial_md5) then
-                    SyncDB.markSeen(root, self.book_id, item.datetime, self.device_id, self.partial_md5)
+                if is_reflowable then
+                    item.page = item_data.pos0
+                else
+                    item.page = item_data.page
+                    item.pboxes = item_data.pboxes
+                        or doc:getPageBoxesFromPositions(item_data.page, item_data.pos0, item_data.pos1)
+                    pcall(function() self.ui.highlight:writePdfAnnotation("save", item) end)
+                end
+                local index = self.ui.annotation:addItem(item)
+                self.ui:handleEvent(Event:new("AnnotationsModified",
+                    { item, nb_highlights_added = 1, index_modified = index }))
+            else
+                local pn_or_xp = is_reflowable and doc:getPageXPointer(item_data.page) or item_data.page
+                local chapter = self.ui.toc:getTocTitleByPage(pn_or_xp)
+                local text = chapter and chapter ~= "" and T(l("in %1"), chapter) or ""
+                local item = {
+                    page = pn_or_xp,
+                    text = text,
+                    chapter = chapter,
+                    datetime = item_data.datetime,
+                }
+                local index = self.ui.annotation:addItem(item)
+                self.ui:handleEvent(Event:new("AnnotationsModified", { item, index_modified = index }))
+            end
+            imported_count = imported_count + 1
+            local_by_datetime[item_data.datetime] = true
+        end
+
+        local existing = SyncDB.readMark(root, self.book_id, item_data.datetime) or {
+            datetime = item_data.datetime,
+            exact = item_data.exact,
+            drawer = item_data.drawer,
+            color = item_data.color,
+            notes = item_data.notes,
+        }
+        existing.loc = existing.loc or {}
+        if not item_data.from_loc then
+            existing.loc[self.partial_md5] = {
+                format = self.format,
+                pos0 = item_data.pos0,
+                pos1 = item_data.pos1,
+                page = item_data.page,
+            }
+            SyncDB.writeMark(root, self.book_id, existing, self.device_id, true)
+        end
+        SyncDB.markSeen(root, self.book_id, item_data.datetime, self.device_id, self.partial_md5)
+    end
+    self._is_importing = false
+    return imported_count
+end
+
+function BookmarkSync:resolveImportAnchors(list)
+    local doc = self.ui.document
+    local subprocess_results = { found = {}, unfound = {} }
+    for _, ext_bm in ipairs(list) do
+        local found_in_subprocess = false
+        local loc = ext_bm.loc and ext_bm.loc[self.partial_md5]
+        if loc and loc.pos0 and (loc.page or loc.pageno) then
+            found_in_subprocess = true
+            table.insert(subprocess_results.found, {
+                pos0 = loc.pos0,
+                pos1 = loc.pos1,
+                page = loc.page or loc.pageno,
+                pboxes = loc.pboxes,
+                exact = ext_bm.exact,
+                datetime = ext_bm.datetime,
+                drawer = ext_bm.drawer,
+                color = ext_bm.color,
+                notes = ext_bm.notes or ext_bm.note,
+                from_loc = true,
+            })
+        else
+            pcall(function()
+                local pos0, pos1, page = Anchoring.findAnchor(doc, ext_bm, self.ui.view.state)
+                if pos0 and page then
+                    found_in_subprocess = true
+                    table.insert(subprocess_results.found, {
+                        pos0 = pos0,
+                        pos1 = pos1,
+                        page = page,
+                        exact = ext_bm.exact,
+                        datetime = ext_bm.datetime,
+                        drawer = ext_bm.drawer,
+                        color = ext_bm.color,
+                        notes = ext_bm.notes or ext_bm.note,
+                    })
                 end
             end)
         end
-    end
-
-    -- Marks present in store but missing from the book → gone (unless soft-miss / not yet applied).
-    for _, mark in ipairs(SyncDB.listMarks(root, self.book_id)) do
-        if not current_datetimes[mark.datetime] then
-            local gone = SyncDB.isMarkGone(root, self.book_id, mark.datetime)
-            local seen = SyncDB.isSeen(root, self.book_id, mark.datetime, self.device_id, self.partial_md5)
-            local has_loc = mark.loc and mark.loc[self.partial_md5]
-            -- Soft miss: already tried and marked seen without a local annotation.
-            -- Hard delete: was seen with loc / was in this book before.
-            if gone == false and seen and has_loc then
-                -- If annotation vanished after being applied here, treat as user delete.
-                -- Heuristic: if it had loc for this fp and is no longer in annotations.
-                SyncDB.markGone(root, self.book_id, mark.datetime, self.device_id)
-                logger.dbg("bookmarks_sync: Marking bookmark as gone:", mark.datetime)
-            end
+        if not found_in_subprocess then
+            table.insert(subprocess_results.unfound, ext_bm)
         end
     end
-    logger.dbg("bookmarks_sync: exportLocalBookmarks finished.")
+    return subprocess_results
 end
 
 function BookmarkSync:importExternalBookmarks()
@@ -843,10 +1048,8 @@ function BookmarkSync:importExternalBookmarks()
         if gone then
             -- skip deleted
         elseif gone == nil then
-            -- ambiguous gone/back same journal number → ask
             table.insert(bookmarks_to_import, { mark = mark, ambiguous = true })
         elseif local_by_datetime[mark.datetime] then
-            -- already in book; still may need loc for this fingerprint
             if SyncDB.needsReanchor(root, self.book_id, mark.datetime, self.device_id, self.partial_md5)
                 and not (mark.loc and mark.loc[self.partial_md5]) then
                 table.insert(bookmarks_to_import, { mark = mark })
@@ -857,7 +1060,6 @@ function BookmarkSync:importExternalBookmarks()
         end
     end
 
-    -- Resolve ambiguous gone/back first.
     local ambiguous = {}
     local normal = {}
     for _, item in ipairs(bookmarks_to_import) do
@@ -876,130 +1078,55 @@ function BookmarkSync:importExternalBookmarks()
             return
         end
 
-        local info = InfoMessage:new { text = l("Syncing bookmarks… (tap to cancel)") }
+        local total = #list
+        local info = InfoMessage:new {
+            text = T(l("Syncing bookmarks… 0/%1 (tap to cancel)"), total),
+        }
         UIManager:show(info)
         UIManager:forceRePaint()
 
-        local completed, results = Trapper:dismissableRunInSubprocess(function()
-            local subprocess_results = { found = {}, unfound = {} }
-            for i, ext_bm in ipairs(list) do
-                local found_in_subprocess = false
-                -- Prefer existing coordinates for this fingerprint.
-                local loc = ext_bm.loc and ext_bm.loc[self.partial_md5]
-                if loc and loc.pos0 and (loc.page or loc.pageno) then
-                    found_in_subprocess = true
-                    table.insert(subprocess_results.found, {
-                        pos0 = loc.pos0,
-                        pos1 = loc.pos1,
-                        page = loc.page or loc.pageno,
-                        pboxes = loc.pboxes,
-                        exact = ext_bm.exact,
-                        datetime = ext_bm.datetime,
-                        drawer = ext_bm.drawer,
-                        color = ext_bm.color,
-                        notes = ext_bm.notes or ext_bm.note,
-                        from_loc = true,
-                    })
-                else
-                    pcall(function()
-                        local pos0, pos1, page = Anchoring.findAnchor(doc, ext_bm, self.ui.view.state)
-                        if pos0 and page then
-                            found_in_subprocess = true
-                            table.insert(subprocess_results.found, {
-                                pos0 = pos0,
-                                pos1 = pos1,
-                                page = page,
-                                exact = ext_bm.exact,
-                                datetime = ext_bm.datetime,
-                                drawer = ext_bm.drawer,
-                                color = ext_bm.color,
-                                notes = ext_bm.notes or ext_bm.note,
-                            })
-                        end
-                    end)
-                end
-                if not found_in_subprocess then
-                    table.insert(subprocess_results.unfound, ext_bm)
-                end
+        local imported_count = 0
+        local unfound_bookmarks = {}
+        local cancelled = false
+        local processed = 0
+        local offset = 1
+        while offset <= total do
+            local chunk = {}
+            for i = offset, math.min(offset + BATCH_SIZE - 1, total) do
+                table.insert(chunk, list[i])
             end
-            return subprocess_results
-        end, info)
+            UIManager:close(info)
+            info = InfoMessage:new {
+                text = T(l("Syncing bookmarks… %1/%2 (tap to cancel)"), processed, total),
+            }
+            UIManager:show(info)
+            UIManager:forceRePaint()
+
+            local chunk_list = chunk
+            local completed, results = Trapper:dismissableRunInSubprocess(function()
+                return self:resolveImportAnchors(chunk_list)
+            end, info)
+
+            if completed and results then
+                imported_count = imported_count + self:applyImportFound(results.found or {}, local_by_datetime)
+                for _, u in ipairs(results.unfound or {}) do
+                    table.insert(unfound_bookmarks, u)
+                end
+                processed = processed + #chunk
+                offset = offset + BATCH_SIZE
+                if offset <= total then
+                    self:yieldPause(BATCH_PAUSE_SEC)
+                end
+            else
+                cancelled = true
+                logger.info("bookmarks_sync: Import cancelled after", processed, "of", total)
+                break
+            end
+        end
 
         UIManager:close(info)
-        if not completed then
-            logger.info("bookmarks_sync: Import cancelled by user.")
-            return
-        end
 
-        local found_bookmarks = (results and results.found) or {}
-        local unfound_bookmarks = (results and results.unfound) or {}
         local is_reflowable = not (doc.is_pdf or doc.is_djvu)
-        local imported_count = 0
-        self._is_importing = true
-
-        for _, item_data in ipairs(found_bookmarks) do
-            if not local_by_datetime[item_data.datetime] then
-                if item_data.drawer then
-                    local item = {
-                        pos0 = item_data.pos0,
-                        pos1 = item_data.pos1,
-                        text = item_data.exact,
-                        datetime = item_data.datetime or os.date("%Y-%m-%d %H:%M:%S"),
-                        drawer = item_data.drawer,
-                        color = item_data.color,
-                        notes = item_data.notes,
-                        chapter = self.ui.toc:getTocTitleByPage(item_data.page),
-                    }
-                    if is_reflowable then
-                        item.page = item_data.pos0
-                    else
-                        item.page = item_data.page
-                        item.pboxes = item_data.pboxes
-                            or doc:getPageBoxesFromPositions(item_data.page, item_data.pos0, item_data.pos1)
-                        pcall(function() self.ui.highlight:writePdfAnnotation("save", item) end)
-                    end
-                    local index = self.ui.annotation:addItem(item)
-                    self.ui:handleEvent(Event:new("AnnotationsModified",
-                        { item, nb_highlights_added = 1, index_modified = index }))
-                else
-                    local pn_or_xp = is_reflowable and doc:getPageXPointer(item_data.page) or item_data.page
-                    local chapter = self.ui.toc:getTocTitleByPage(pn_or_xp)
-                    local text = chapter and chapter ~= "" and T(l("in %1"), chapter) or ""
-                    local item = {
-                        page = pn_or_xp,
-                        text = text,
-                        chapter = chapter,
-                        datetime = item_data.datetime,
-                    }
-                    local index = self.ui.annotation:addItem(item)
-                    self.ui:handleEvent(Event:new("AnnotationsModified", { item, index_modified = index }))
-                end
-                imported_count = imported_count + 1
-                local_by_datetime[item_data.datetime] = true
-            end
-
-            -- Persist loc for this fingerprint and mark seen.
-            local existing = SyncDB.readMark(root, self.book_id, item_data.datetime) or {
-                datetime = item_data.datetime,
-                exact = item_data.exact,
-                drawer = item_data.drawer,
-                color = item_data.color,
-                notes = item_data.notes,
-            }
-            existing.loc = existing.loc or {}
-            if not item_data.from_loc then
-                existing.loc[self.partial_md5] = {
-                    format = self.format,
-                    pos0 = item_data.pos0,
-                    pos1 = item_data.pos1,
-                    page = item_data.page,
-                }
-                SyncDB.writeMark(root, self.book_id, existing, self.device_id, true)
-            end
-            SyncDB.markSeen(root, self.book_id, item_data.datetime, self.device_id, self.partial_md5)
-        end
-        self._is_importing = false
-
         if #unfound_bookmarks > 0 then
             local unfound_texts = {}
             for _, unfound_bm in ipairs(unfound_bookmarks) do
@@ -1048,12 +1175,24 @@ function BookmarkSync:importExternalBookmarks()
 
         if imported_count > 0 then
             local N_ = l.ngettext
+            local msg
+            if cancelled then
+                msg = T(N_("Synced 1 bookmark (cancelled, partial)",
+                    "Synced %1 bookmarks (cancelled, partial)", imported_count), imported_count)
+            else
+                msg = T(N_("Synced 1 bookmark from another format",
+                    "Synced %1 bookmarks from other formats", imported_count), imported_count)
+            end
             UIManager:show(InfoMessage:new {
-                text = T(N_("Synced 1 bookmark from another format",
-                    "Synced %1 bookmarks from other formats", imported_count), imported_count),
+                text = msg,
                 timeout = 3,
             })
             self.ui:handleEvent(Event:new("ForceRepaint"))
+        elseif cancelled then
+            UIManager:show(InfoMessage:new {
+                text = l("Bookmark sync cancelled."),
+                timeout = 2,
+            })
         end
     end
 
